@@ -1,0 +1,351 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "kubernetes etcd stack.",
+  "Parameters": {
+    "Stack": {
+      "Default": "kubernetes-etcd-dev",
+      "Description": "Stack applied as a tag",
+      "Type": "String"
+    },
+    "VpcId": {
+      "Description": "The ID of the VPC we're launching into",
+      "Type": "String"
+    },
+    "EC2KeyName": {
+      "Default": "kubernetes",
+      "Description": "Name of an existing EC2 KeyPair for SSH access",
+      "Type": "AWS::EC2::KeyPair::KeyName"
+    },
+    "InstanceType": {
+      "Description": "EC2 instance type used for etcd servers",
+      "Type": "String",
+      "Default": "t2.micro"
+    },
+    "SubnetPublicA": {
+      "Description": "Subnet Id for Public Zone A",
+      "Type": "String",
+      "Default": ""
+    },
+    "SubnetPublicB": {
+      "Description": "Subnet Id for Public Zone B",
+      "Type": "String",
+      "Default": ""
+    },
+    "EtcdAvailabilityZones": {
+      "Description": "The Availability Zones used for the autoscaling group",
+      "Type": "CommaDelimitedList"
+    },
+    "DiscoveryURL": {
+      "Description": "An unique etcd cluster discovery URL. Grab a new token from https://discovery.etcd.io/new?size=<your cluster size>",
+      "Type": "String"
+    },
+    "ClusterSize": {
+      "Default": "3",
+      "MinValue": "3",
+      "MaxValue": "12",
+      "Description": "Number of nodes in cluster (3-12).",
+      "Type": "Number"
+    },
+    "AdvertisedIPAddress": {
+      "Description": "Use 'private' if your etcd cluster is within one region or 'public' if it spans regions or cloud providers.",
+      "Default": "private",
+      "AllowedValues": [
+        "private",
+        "public"
+      ],
+      "Type": "String"
+    },
+    "AllowSSHFrom": {
+      "Description": "The net block (CIDR) which is permitted to ssh to the Etcd servers.",
+      "Default": "0.0.0.0/0",
+      "Type": "String"
+    }
+  },
+  "Mappings": {
+    "RegionMap": {
+      "eu-central-1": {
+        "AMI": "ami-74bbba69"
+      },
+      "ap-northeast-1": {
+        "AMI": "ami-1e77ff1e"
+      },
+      "sa-east-1": {
+        "AMI": "ami-632ba17e"
+      },
+      "ap-southeast-2": {
+        "AMI": "ami-83f8b4b9"
+      },
+      "ap-southeast-1": {
+        "AMI": "ami-12060c40"
+      },
+      "us-east-1": {
+        "AMI": "ami-f396fa96"
+      },
+      "us-west-2": {
+        "AMI": "ami-99bfada9"
+      },
+      "us-west-1": {
+        "AMI": "ami-dbe71d9f"
+      },
+      "eu-west-1": {
+        "AMI": "ami-83e9c8f4"
+      }
+    }
+  },
+  "Resources": {
+    "SecurityGroupEtcd": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Etcd External SecurityGroup",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": "22",
+            "ToPort": "22",
+            "CidrIp": {
+              "Ref": "AllowSSHFrom"
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "etcd-sg"
+          },
+          {
+            "Key": "Application",
+            "Value": {
+              "Ref": "AWS::StackId"
+            }
+          }
+        ]
+      }
+    },
+    "SecurityGroupInternalEtcd": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Etcd Internal SecurityGroup",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": "2379",
+            "ToPort": "2379",
+            "SourceSecurityGroupId": {
+              "Fn::GetAtt": [
+                "SecurityGroupEtcd",
+                "GroupId"
+              ]
+            }
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": "2380",
+            "ToPort": "2380",
+            "SourceSecurityGroupId": {
+              "Fn::GetAtt": [
+                "SecurityGroupEtcd",
+                "GroupId"
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "etcd-internal-sg"
+          },
+          {
+            "Key": "Application",
+            "Value": {
+              "Ref": "AWS::StackId"
+            }
+          }
+        ]
+      }
+    },
+    "RoleEtcd": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ec2.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "etcd-policy",
+            "PolicyDocument": {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:Describe*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "autoscaling:Describe*"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ],
+        "Path": "/"
+      }
+    },
+    "InstanceProfileEtcd": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Path": "/",
+        "Roles": [
+          {
+            "Ref": "RoleEtcd"
+          }
+        ]
+      }
+    },
+    "AutoScalingGroupEtcd": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "Properties": {
+        "AvailabilityZones": {
+          "Ref": "EtcdAvailabilityZones"
+        },
+        "LaunchConfigurationName": {
+          "Ref": "LaunchConfigEtcd"
+        },
+        "MinSize": "3",
+        "MaxSize": "12",
+        "DesiredCapacity": {
+          "Ref": "ClusterSize"
+        },
+        "VPCZoneIdentifier": [
+          {
+            "Ref": "SubnetPublicA"
+          },
+          {
+            "Ref": "SubnetPublicB"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Ref": "AWS::StackName"
+            },
+            "PropagateAtLaunch": true
+          }
+        ]
+      }
+    },
+    "LaunchConfigEtcd": {
+      "Type": "AWS::AutoScaling::LaunchConfiguration",
+      "Properties": {
+        "AssociatePublicIpAddress": "true",
+        "IamInstanceProfile": {
+          "Ref": "InstanceProfileEtcd"
+        },
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "KeyName": {
+          "Ref": "EC2KeyName"
+        },
+        "ImageId": {
+          "Fn::FindInMap": [
+            "RegionMap",
+            {
+              "Ref": "AWS::Region"
+            },
+            "AMI"
+          ]
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "SecurityGroupEtcd"
+          },
+          {
+            "Ref": "SecurityGroupInternalEtcd"
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Join": [
+              "",
+              [
+                "#cloud-config\n",
+                "\n",
+                "coreos:\n",
+                "  update:\n",
+                "    reboot-strategy: \"off\"\n",
+                "\n",
+                "  etcd2:\n",
+                "    discovery: ",
+                {
+                  "Ref": "DiscoveryURL"
+                },
+                "\n",
+                "    advertise-client-urls: http://$",
+                {
+                  "Ref": "AdvertisedIPAddress"
+                },
+                "_ipv4:2379\n",
+                "    initial-advertise-peer-urls: http://$",
+                {
+                  "Ref": "AdvertisedIPAddress"
+                },
+                "_ipv4:2380\n",
+                "    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001\n",
+                "    listen-peer-urls: http://$",
+                {
+                  "Ref": "AdvertisedIPAddress"
+                },
+                "_ipv4:2380\n",
+                "  fleet:\n",
+                "    metadata: disk=ssd,env=itlab,platform=ec2,provider=aws,region=us-west-2,role=etcd2\n",
+                "    public-ip: $",
+                {
+                  "Ref": "AdvertisedIPAddress"
+                },
+                "_ipv4\n",
+                "\n",
+                "  units:\n",
+                "\n",
+                "  - name: etcd2.service\n",
+                "    command: start\n",
+                "  - name: fleet.service\n",
+                "    command: start\n"
+              ]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "AutoScalingGroupEtcd": {
+      "Value": {
+        "Ref": "AutoScalingGroupEtcd"
+      }
+    }
+  }
+}
